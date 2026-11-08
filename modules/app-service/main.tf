@@ -16,10 +16,10 @@ resource "azurerm_linux_web_app" "this" {
   tags                = var.tags
 
   site_config {
-    always_on                         = var.always_on
-    minimum_tls_version               = "1.2"
-    http2_enabled                     = true
-    ftps_state                        = "Disabled"
+    always_on           = var.always_on
+    minimum_tls_version = "1.2"
+    http2_enabled       = true
+    ftps_state          = "Disabled"
   }
 
   app_settings = merge(
