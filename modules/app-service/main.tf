@@ -140,14 +140,14 @@ resource "azurerm_traffic_manager_profile" "this" {
 
 resource "azurerm_traffic_manager_azure_endpoint" "primary" {
   name               = "primary"
-  profile_id          = azurerm_traffic_manager_profile.this.id
+  profile_id         = azurerm_traffic_manager_profile.this.id
   target_resource_id = azurerm_linux_web_app.primary.id
   priority           = 1
 }
 
 resource "azurerm_traffic_manager_azure_endpoint" "secondary" {
   name               = "secondary"
-  profile_id          = azurerm_traffic_manager_profile.this.id
+  profile_id         = azurerm_traffic_manager_profile.this.id
   target_resource_id = azurerm_linux_web_app.secondary.id
   priority           = 2
 }
