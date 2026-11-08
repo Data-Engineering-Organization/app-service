@@ -1,0 +1,184 @@
+name: Terraform and Azure App Service
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "**/*.tf"
+      - "**/*.tfvars"
+      - ".github/workflows/terraform-deploy.yml"
+  push:
+    branches: [main]
+    paths:
+      - "**/*.tf"
+      - "**/*.tfvars"
+      - ".github/workflows/terraform-deploy.yml"
+  workflow_dispatch:
+    inputs:
+      deploy_app:
+        description: Deploy app.zip to dev and UAT after infrastructure
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: 1.9.8
+  TF_IN_AUTOMATION: true
+  ARM_USE_AZUREAD: true
+
+jobs:
+  validate:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Check formatting
+        run: terraform fmt -check -recursive
+      - name: Validate dev and UAT
+        run: |
+          for environment in dev uat; do
+            terraform -chdir="environments/$environment" init -backend=false -input=false
+            terraform -chdir="environments/$environment" validate
+          done
+
+  deploy_dev:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment:
+      name: dev
+    env:
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+    outputs:
+      web_app_name: ${{ steps.outputs.outputs.web_app_name }}
+      resource_group_name: ${{ steps.outputs.outputs.resource_group_name }}
+      app_url: ${{ steps.outputs.outputs.app_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Initialize, plan, and apply dev
+        working-directory: environments/dev
+        run: |
+          set -euo pipefail
+          terraform init -input=false
+          terraform validate
+          terraform plan -input=false -out=tfplan
+          terraform apply -input=false -auto-approve tfplan
+      - name: Capture dev outputs
+        id: outputs
+        working-directory: environments/dev
+        run: |
+          echo "web_app_name=$(terraform output -raw web_app_name)" >> "$GITHUB_OUTPUT"
+          echo "resource_group_name=$(terraform output -raw resource_group_name)" >> "$GITHUB_OUTPUT"
+          echo "app_url=$(terraform output -raw app_url)" >> "$GITHUB_OUTPUT"
+      - name: Deploy app ZIP to dev
+        if: github.event_name == 'workflow_dispatch' && inputs.deploy_app
+        env:
+          WEB_APP_NAME: ${{ steps.outputs.outputs.web_app_name }}
+          RESOURCE_GROUP: ${{ steps.outputs.outputs.resource_group_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! -f app.zip ]]; then
+            echo "Expected app.zip at the repository root. Add an app build/package step before enabling deploy_app."
+            exit 1
+          fi
+          az webapp deploy --resource-group "$RESOURCE_GROUP" --name "$WEB_APP_NAME" --src-path app.zip --type zip
+
+  validate_dev:
+    needs: deploy_dev
+    runs-on: ubuntu-latest
+    environment:
+      name: dev
+    env:
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Verify dev App Service is running
+        env:
+          WEB_APP_NAME: ${{ needs.deploy_dev.outputs.web_app_name }}
+          RESOURCE_GROUP: ${{ needs.deploy_dev.outputs.resource_group_name }}
+        run: |
+          set -euo pipefail
+          for attempt in {1..12}; do
+            state="$(az webapp show --resource-group "$RESOURCE_GROUP" --name "$WEB_APP_NAME" --query state --output tsv)"
+            if [[ "$state" == "Running" ]]; then
+              echo "Dev App Service is running."
+              exit 0
+            fi
+            echo "App Service state is '$state'; retrying in 10 seconds."
+            sleep 10
+          done
+          echo "Dev App Service did not reach Running state."
+          exit 1
+
+  deploy_uat:
+    needs: validate_dev
+    runs-on: ubuntu-latest
+    environment:
+      name: uat
+    env:
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Plan and apply UAT
+        working-directory: environments/uat
+        run: |
+          set -euo pipefail
+          terraform init -input=false
+          terraform validate
+          terraform plan -input=false -out=tfplan
+          terraform apply -input=false -auto-approve tfplan
+      - name: Capture UAT outputs
+        id: uat
+        working-directory: environments/uat
+        run: |
+          echo "web_app_name=$(terraform output -raw web_app_name)" >> "$GITHUB_OUTPUT"
+          echo "resource_group_name=$(terraform output -raw resource_group_name)" >> "$GITHUB_OUTPUT"
+      - name: Deploy app ZIP to UAT
+        if: github.event_name == 'workflow_dispatch' && inputs.deploy_app
+        env:
+          WEB_APP_NAME: ${{ steps.uat.outputs.web_app_name }}
+          RESOURCE_GROUP: ${{ steps.uat.outputs.resource_group_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! -f app.zip ]]; then
+            echo "Expected app.zip at the repository root. Add an app build/package step before enabling deploy_app."
+            exit 1
+          fi
+          az webapp deploy --resource-group "$RESOURCE_GROUP" --name "$WEB_APP_NAME" --src-path app.zip --type zip
