@@ -8,6 +8,12 @@ variable "location" {
   type        = string
 }
 
+variable "secondary_location" {
+  description = "Paired Azure region hosting the disaster-recovery app."
+  type        = string
+  default     = "South India"
+}
+
 variable "environment" {
   description = "Deployment environment name."
   type        = string
@@ -19,19 +25,19 @@ variable "resource_group_name" {
 }
 
 variable "sku_name" {
-  description = "App Service Plan SKU, for example B1 or P1v3."
+  description = "App Service Plan SKU. Standard or higher is required for deployment slots."
   type        = string
-  default     = "B1"
+  default     = "S1"
+}
+
+variable "health_check_path" {
+  description = "Application endpoint used by App Service, deployment validation, and Traffic Manager health probes. The app must return HTTP 200 here."
+  type        = string
+  default     = "/health"
 }
 
 variable "always_on" {
   description = "Keep the app loaded. Requires an eligible non-Free plan."
-  type        = bool
-  default     = true
-}
-
-variable "https_only" {
-  description = "Require HTTPS for incoming requests."
   type        = bool
   default     = true
 }

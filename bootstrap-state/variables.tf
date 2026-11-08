@@ -16,6 +16,12 @@ variable "storage_account_prefix" {
   default     = "tfstate"
 }
 
+variable "account_replication_type" {
+  description = "Storage redundancy type for remote Terraform state. GRS replicates to the paired region."
+  type        = string
+  default     = "GRS"
+}
+
 output "resource_group_name" {
   value = azurerm_resource_group.state.name
 }
