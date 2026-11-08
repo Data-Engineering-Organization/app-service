@@ -2,13 +2,13 @@ name: Terraform and Azure App Service
 
 on:
   pull_request:
-    branches: [main, develop]
+    branches: [main]
     paths:
       - "**/*.tf"
       - "**/*.tfvars"
       - ".github/workflows/terraform-deploy.yml"
   push:
-    branches: [main, develop]
+    branches: [main]
     paths:
       - "**/*.tf"
       - "**/*.tfvars"
