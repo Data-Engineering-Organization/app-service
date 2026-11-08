@@ -10,10 +10,22 @@ variable "location" {
   default     = "Central India"
 }
 
+variable "secondary_location" {
+  description = "Paired region used for disaster recovery."
+  type        = string
+  default     = "South India"
+}
+
 variable "sku_name" {
   description = "App Service Plan SKU."
   type        = string
-  default     = "B1"
+  default     = "S1"
+}
+
+variable "health_check_path" {
+  description = "The application must return HTTP 200 at this path."
+  type        = string
+  default     = "/health"
 }
 
 variable "always_on" {

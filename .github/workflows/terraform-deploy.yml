@@ -2,13 +2,13 @@ name: Terraform and Azure App Service
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, develop]
     paths:
       - "**/*.tf"
       - "**/*.tfvars"
       - ".github/workflows/terraform-deploy.yml"
   push:
-    branches: [main]
+    branches: [main, develop]
     paths:
       - "**/*.tf"
       - "**/*.tfvars"
@@ -50,8 +50,7 @@ jobs:
   deploy_dev:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    environment:
-      name: dev
+    environment: dev
     env:
       ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
@@ -60,7 +59,11 @@ jobs:
     outputs:
       web_app_name: ${{ steps.outputs.outputs.web_app_name }}
       resource_group_name: ${{ steps.outputs.outputs.resource_group_name }}
-      app_url: ${{ steps.outputs.outputs.app_url }}
+      traffic_manager_fqdn: ${{ steps.outputs.outputs.traffic_manager_fqdn }}
+      staging_hostname: ${{ steps.outputs.outputs.staging_hostname }}
+      secondary_web_app_name: ${{ steps.outputs.outputs.secondary_web_app_name }}
+      secondary_staging_hostname: ${{ steps.outputs.outputs.secondary_staging_hostname }}
+      health_check_path: ${{ steps.outputs.outputs.health_check_path }}
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
@@ -68,10 +71,8 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
       - uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          creds: >-
+            {"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}"}
       - name: Initialize, plan, and apply dev
         working-directory: environments/dev
         run: |
@@ -86,25 +87,37 @@ jobs:
         run: |
           echo "web_app_name=$(terraform output -raw web_app_name)" >> "$GITHUB_OUTPUT"
           echo "resource_group_name=$(terraform output -raw resource_group_name)" >> "$GITHUB_OUTPUT"
-          echo "app_url=$(terraform output -raw app_url)" >> "$GITHUB_OUTPUT"
+          echo "traffic_manager_fqdn=$(terraform output -raw traffic_manager_fqdn)" >> "$GITHUB_OUTPUT"
+          echo "staging_hostname=$(terraform output -raw staging_hostname)" >> "$GITHUB_OUTPUT"
+          echo "secondary_web_app_name=$(terraform output -raw secondary_web_app_name)" >> "$GITHUB_OUTPUT"
+          echo "secondary_staging_hostname=$(terraform output -raw secondary_staging_hostname)" >> "$GITHUB_OUTPUT"
+          echo "health_check_path=$(terraform output -raw health_check_path)" >> "$GITHUB_OUTPUT"
       - name: Deploy app ZIP to dev
         if: github.event_name == 'workflow_dispatch' && inputs.deploy_app
         env:
           WEB_APP_NAME: ${{ steps.outputs.outputs.web_app_name }}
+          SECONDARY_WEB_APP_NAME: ${{ steps.outputs.outputs.secondary_web_app_name }}
           RESOURCE_GROUP: ${{ steps.outputs.outputs.resource_group_name }}
+          STAGING_HOSTNAME: ${{ steps.outputs.outputs.staging_hostname }}
+          SECONDARY_STAGING_HOSTNAME: ${{ steps.outputs.outputs.secondary_staging_hostname }}
+          HEALTH_CHECK_PATH: ${{ steps.outputs.outputs.health_check_path }}
         run: |
           set -euo pipefail
           if [[ ! -f app.zip ]]; then
             echo "Expected app.zip at the repository root. Add an app build/package step before enabling deploy_app."
             exit 1
           fi
-          az webapp deploy --resource-group "$RESOURCE_GROUP" --name "$WEB_APP_NAME" --src-path app.zip --type zip
+          az webapp deploy --resource-group "$RESOURCE_GROUP" --name "$WEB_APP_NAME" --slot staging --src-path app.zip --type zip
+          az webapp deploy --resource-group "$RESOURCE_GROUP" --name "$SECONDARY_WEB_APP_NAME" --slot staging --src-path app.zip --type zip
+          curl --fail --show-error --retry 18 --retry-delay 10 --retry-connrefused "https://${STAGING_HOSTNAME}${HEALTH_CHECK_PATH}"
+          curl --fail --show-error --retry 18 --retry-delay 10 --retry-connrefused "https://${SECONDARY_STAGING_HOSTNAME}${HEALTH_CHECK_PATH}"
+          az webapp deployment slot swap --resource-group "$RESOURCE_GROUP" --name "$SECONDARY_WEB_APP_NAME" --slot staging --target-slot production
+          az webapp deployment slot swap --resource-group "$RESOURCE_GROUP" --name "$WEB_APP_NAME" --slot staging --target-slot production
 
   validate_dev:
     needs: deploy_dev
     runs-on: ubuntu-latest
-    environment:
-      name: dev
+    environment: dev
     env:
       ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
@@ -113,20 +126,20 @@ jobs:
     steps:
       - uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          creds: >-
+            {"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}"}
       - name: Verify dev App Service is running
         env:
           WEB_APP_NAME: ${{ needs.deploy_dev.outputs.web_app_name }}
+          SECONDARY_WEB_APP_NAME: ${{ needs.deploy_dev.outputs.secondary_web_app_name }}
           RESOURCE_GROUP: ${{ needs.deploy_dev.outputs.resource_group_name }}
         run: |
           set -euo pipefail
           for attempt in {1..12}; do
             state="$(az webapp show --resource-group "$RESOURCE_GROUP" --name "$WEB_APP_NAME" --query state --output tsv)"
-            if [[ "$state" == "Running" ]]; then
-              echo "Dev App Service is running."
+            secondary_state="$(az webapp show --resource-group "$RESOURCE_GROUP" --name "$SECONDARY_WEB_APP_NAME" --query state --output tsv)"
+            if [[ "$state" == "Running" && "$secondary_state" == "Running" ]]; then
+              echo "Primary and secondary dev App Services are running."
               exit 0
             fi
             echo "App Service state is '$state'; retrying in 10 seconds."
@@ -138,8 +151,7 @@ jobs:
   deploy_uat:
     needs: validate_dev
     runs-on: ubuntu-latest
-    environment:
-      name: uat
+    environment: uat
     env:
       ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
@@ -152,10 +164,8 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
       - uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          creds: >-
+            {"clientId":"${{ secrets.AZURE_CLIENT_ID }}","clientSecret":"${{ secrets.AZURE_CLIENT_SECRET }}","tenantId":"${{ secrets.AZURE_TENANT_ID }}","subscriptionId":"${{ secrets.AZURE_SUBSCRIPTION_ID }}"}
       - name: Plan and apply UAT
         working-directory: environments/uat
         run: |
@@ -170,15 +180,28 @@ jobs:
         run: |
           echo "web_app_name=$(terraform output -raw web_app_name)" >> "$GITHUB_OUTPUT"
           echo "resource_group_name=$(terraform output -raw resource_group_name)" >> "$GITHUB_OUTPUT"
+          echo "staging_hostname=$(terraform output -raw staging_hostname)" >> "$GITHUB_OUTPUT"
+          echo "secondary_web_app_name=$(terraform output -raw secondary_web_app_name)" >> "$GITHUB_OUTPUT"
+          echo "secondary_staging_hostname=$(terraform output -raw secondary_staging_hostname)" >> "$GITHUB_OUTPUT"
+          echo "health_check_path=$(terraform output -raw health_check_path)" >> "$GITHUB_OUTPUT"
       - name: Deploy app ZIP to UAT
         if: github.event_name == 'workflow_dispatch' && inputs.deploy_app
         env:
           WEB_APP_NAME: ${{ steps.uat.outputs.web_app_name }}
+          SECONDARY_WEB_APP_NAME: ${{ steps.uat.outputs.secondary_web_app_name }}
           RESOURCE_GROUP: ${{ steps.uat.outputs.resource_group_name }}
+          STAGING_HOSTNAME: ${{ steps.uat.outputs.staging_hostname }}
+          SECONDARY_STAGING_HOSTNAME: ${{ steps.uat.outputs.secondary_staging_hostname }}
+          HEALTH_CHECK_PATH: ${{ steps.uat.outputs.health_check_path }}
         run: |
           set -euo pipefail
           if [[ ! -f app.zip ]]; then
             echo "Expected app.zip at the repository root. Add an app build/package step before enabling deploy_app."
             exit 1
           fi
-          az webapp deploy --resource-group "$RESOURCE_GROUP" --name "$WEB_APP_NAME" --src-path app.zip --type zip
+          az webapp deploy --resource-group "$RESOURCE_GROUP" --name "$WEB_APP_NAME" --slot staging --src-path app.zip --type zip
+          az webapp deploy --resource-group "$RESOURCE_GROUP" --name "$SECONDARY_WEB_APP_NAME" --slot staging --src-path app.zip --type zip
+          curl --fail --show-error --retry 18 --retry-delay 10 --retry-connrefused "https://${STAGING_HOSTNAME}${HEALTH_CHECK_PATH}"
+          curl --fail --show-error --retry 18 --retry-delay 10 --retry-connrefused "https://${SECONDARY_STAGING_HOSTNAME}${HEALTH_CHECK_PATH}"
+          az webapp deployment slot swap --resource-group "$RESOURCE_GROUP" --name "$SECONDARY_WEB_APP_NAME" --slot staging --target-slot production
+          az webapp deployment slot swap --resource-group "$RESOURCE_GROUP" --name "$WEB_APP_NAME" --slot staging --target-slot production
